@@ -1,0 +1,404 @@
+// --- libdumper.c ---
+// Made by sourcecodelibbsd.so
+// Compile: gcc -o libdumper libdumper.c -ldl
+// Usage:   ./libdumper <target.so>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <dlfcn.h>
+#include <link.h>
+
+// ── COLOR OUTPUT ─────────────────────────────────────────────────────────────
+#define RED     "\x1b[31m"
+#define GREEN   "\x1b[32m"
+#define YELLOW  "\x1b[33m"
+#define CYAN    "\x1b[36m"
+#define BOLD    "\x1b[1m"
+#define RESET   "\x1b[0m"
+
+// ── ELF CONTEXT ──────────────────────────────────────────────────────────────
+typedef struct {
+    uint8_t*   base;
+    size_t     size;
+    Elf64_Ehdr* ehdr;
+    Elf64_Shdr* shdrs;
+    Elf64_Phdr* phdrs;
+    const char* shstrtab;   // section name string table
+    const char* strtab;     // symbol string table
+    Elf64_Sym*  symtab;
+    size_t      sym_count;
+    const char* dynstr;     // dynamic string table
+    Elf64_Sym*  dynsym;
+    size_t      dynsym_count;
+} ELFCtx;
+
+// ── HELPERS ──────────────────────────────────────────────────────────────────
+
+const char* sym_bind_str(unsigned char info) {
+    switch (ELF64_ST_BIND(info)) {
+        case STB_LOCAL:  return "LOCAL";
+        case STB_GLOBAL: return "GLOBAL";
+        case STB_WEAK:   return "WEAK";
+        default:         return "OTHER";
+    }
+}
+
+const char* sym_type_str(unsigned char info) {
+    switch (ELF64_ST_TYPE(info)) {
+        case STT_NOTYPE:  return "NOTYPE";
+        case STT_OBJECT:  return "OBJECT";
+        case STT_FUNC:    return "FUNC";
+        case STT_SECTION: return "SECTION";
+        case STT_FILE:    return "FILE";
+        case STT_TLS:     return "TLS";
+        default:          return "OTHER";
+    }
+}
+
+const char* sym_vis_str(unsigned char other) {
+    switch (ELF64_ST_VISIBILITY(other)) {
+        case STV_DEFAULT:   return "DEFAULT";
+        case STV_INTERNAL:  return "INTERNAL";
+        case STV_HIDDEN:    return "HIDDEN";
+        case STV_PROTECTED: return "PROTECTED";
+        default:            return "OTHER";
+    }
+}
+
+const char* shtype_str(uint32_t type) {
+    switch (type) {
+        case SHT_NULL:      return "NULL";
+        case SHT_PROGBITS:  return "PROGBITS";
+        case SHT_SYMTAB:    return "SYMTAB";
+        case SHT_STRTAB:    return "STRTAB";
+        case SHT_RELA:      return "RELA";
+        case SHT_HASH:      return "HASH";
+        case SHT_DYNAMIC:   return "DYNAMIC";
+        case SHT_NOTE:      return "NOTE";
+        case SHT_NOBITS:    return "NOBITS";
+        case SHT_REL:       return "REL";
+        case SHT_DYNSYM:    return "DYNSYM";
+        case SHT_INIT_ARRAY: return "INIT_ARRAY";
+        case SHT_FINI_ARRAY: return "FINI_ARRAY";
+        default:             return "OTHER";
+    }
+}
+
+// ── LOAD ELF ─────────────────────────────────────────────────────────────────
+
+int load_elf(const char* path, ELFCtx* ctx) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { perror("open"); return -1; }
+
+    struct stat st;
+    fstat(fd, &st);
+    ctx->size = st.st_size;
+
+    ctx->base = mmap(NULL, ctx->size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+
+    if (ctx->base == MAP_FAILED) { perror("mmap"); return -1; }
+
+    ctx->ehdr = (Elf64_Ehdr*) ctx->base;
+
+    // Magic check
+    if (memcmp(ctx->ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
+        fprintf(stderr, RED "[!] Not a valid ELF file.\n" RESET);
+        munmap(ctx->base, ctx->size);
+        return -1;
+    }
+
+    // 64-bit only for now
+    if (ctx->ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
+        fprintf(stderr, RED "[!] 32-bit ELF not supported in this build.\n" RESET);
+        munmap(ctx->base, ctx->size);
+        return -1;
+    }
+
+    ctx->shdrs    = (Elf64_Shdr*)(ctx->base + ctx->ehdr->e_shoff);
+    ctx->phdrs    = (Elf64_Phdr*)(ctx->base + ctx->ehdr->e_phoff);
+    ctx->shstrtab = (const char*)(ctx->base +
+                    ctx->shdrs[ctx->ehdr->e_shstrndx].sh_offset);
+
+    // Locate .symtab, .strtab, .dynsym, .dynstr
+    for (int i = 0; i < ctx->ehdr->e_shnum; i++) {
+        Elf64_Shdr* sh = &ctx->shdrs[i];
+        const char* name = ctx->shstrtab + sh->sh_name;
+
+        if (sh->sh_type == SHT_SYMTAB) {
+            ctx->symtab   = (Elf64_Sym*)(ctx->base + sh->sh_offset);
+            ctx->sym_count = sh->sh_size / sizeof(Elf64_Sym);
+        }
+        if (sh->sh_type == SHT_STRTAB && strcmp(name, ".strtab") == 0) {
+            ctx->strtab = (const char*)(ctx->base + sh->sh_offset);
+        }
+        if (sh->sh_type == SHT_DYNSYM) {
+            ctx->dynsym      = (Elf64_Sym*)(ctx->base + sh->sh_offset);
+            ctx->dynsym_count = sh->sh_size / sizeof(Elf64_Sym);
+        }
+        if (sh->sh_type == SHT_STRTAB && strcmp(name, ".dynstr") == 0) {
+            ctx->dynstr = (const char*)(ctx->base + sh->sh_offset);
+        }
+    }
+
+    return 0;
+}
+
+// ── DUMP FUNCTIONS ───────────────────────────────────────────────────────────
+
+void dump_header(ELFCtx* ctx) {
+    Elf64_Ehdr* e = ctx->ehdr;
+    const char* types[] = {"NONE","REL","EXEC","DYN","CORE"};
+    const char* etype = (e->e_type < 5) ? types[e->e_type] : "UNKNOWN";
+
+    printf(BOLD CYAN "\n╔══════════════════════════════════════════╗\n");
+    printf(       "║           ELF HEADER DUMP               ║\n");
+    printf(       "╚══════════════════════════════════════════╝\n" RESET);
+
+    printf(YELLOW "  Type:         " RESET "%s\n", etype);
+    printf(YELLOW "  Machine:      " RESET "0x%x\n", e->e_machine);
+    printf(YELLOW "  Entry point:  " RESET "0x%lx\n", e->e_entry);
+    printf(YELLOW "  Sections:     " RESET "%d\n", e->e_shnum);
+    printf(YELLOW "  Segments:     " RESET "%d\n", e->e_phnum);
+    printf(YELLOW "  ELF version:  " RESET "%d\n", e->e_version);
+
+    const char* abi_map[] = {
+        "SystemV","HPUX","NetBSD","Linux","Hurd","","Solaris",
+        "AIX","IRIX","FreeBSD","TRU64","Modesto","OpenBSD","OpenVMS"
+    };
+    uint8_t abi = e->e_ident[EI_OSABI];
+    printf(YELLOW "  OS/ABI:       " RESET "%s\n",
+           (abi < 14) ? abi_map[abi] : "Unknown");
+
+    printf(YELLOW "  Endian:       " RESET "%s\n",
+           e->e_ident[EI_DATA] == ELFDATA2LSB ? "Little" : "Big");
+}
+
+void dump_sections(ELFCtx* ctx) {
+    printf(BOLD CYAN "\n╔══════════════════════════════════════════╗\n");
+    printf(       "║           SECTION TABLE                 ║\n");
+    printf(       "╚══════════════════════════════════════════╝\n" RESET);
+    printf(BOLD "  %-4s %-20s %-12s %-16s %-10s %-6s\n" RESET,
+           "IDX", "NAME", "TYPE", "OFFSET", "SIZE", "FLAGS");
+
+    for (int i = 0; i < ctx->ehdr->e_shnum; i++) {
+        Elf64_Shdr* sh = &ctx->shdrs[i];
+        const char* name = ctx->shstrtab + sh->sh_name;
+
+        char flags[8] = "------";
+        if (sh->sh_flags & SHF_WRITE)     flags[0] = 'W';
+        if (sh->sh_flags & SHF_ALLOC)     flags[1] = 'A';
+        if (sh->sh_flags & SHF_EXECINSTR) flags[2] = 'X';
+        if (sh->sh_flags & SHF_MERGE)     flags[3] = 'M';
+        if (sh->sh_flags & SHF_STRINGS)   flags[4] = 'S';
+        if (sh->sh_flags & SHF_TLS)       flags[5] = 'T';
+
+        printf("  %-4d %-20s %-12s 0x%-14lx %-10lu %s\n",
+               i, name, shtype_str(sh->sh_type),
+               sh->sh_offset, sh->sh_size, flags);
+    }
+}
+
+void dump_segments(ELFCtx* ctx) {
+    printf(BOLD CYAN "\n╔══════════════════════════════════════════╗\n");
+    printf(       "║           PROGRAM HEADERS               ║\n");
+    printf(       "╚══════════════════════════════════════════╝\n" RESET);
+
+    const char* ptypes[] = {
+        "NULL","LOAD","DYNAMIC","INTERP","NOTE",
+        "SHLIB","PHDR","TLS"
+    };
+
+    printf(BOLD "  %-4s %-10s %-16s %-16s %-10s %-6s\n" RESET,
+           "IDX","TYPE","OFFSET","VADDR","FILESZ","FLAGS");
+
+    for (int i = 0; i < ctx->ehdr->e_phnum; i++) {
+        Elf64_Phdr* ph = &ctx->phdrs[i];
+        const char* ptype = (ph->p_type < 8) ? ptypes[ph->p_type] : "OTHER";
+
+        char flags[4] = "---";
+        if (ph->p_flags & PF_R) flags[0] = 'R';
+        if (ph->p_flags & PF_W) flags[1] = 'W';
+        if (ph->p_flags & PF_X) flags[2] = 'X';
+
+        printf("  %-4d %-10s 0x%-14lx 0x%-14lx %-10lu %s\n",
+               i, ptype, ph->p_offset, ph->p_vaddr,
+               ph->p_filesz, flags);
+    }
+}
+
+void dump_dynamic_symbols(ELFCtx* ctx) {
+    if (!ctx->dynsym || !ctx->dynstr) {
+        printf(RED "\n[!] No .dynsym section found.\n" RESET);
+        return;
+    }
+
+    printf(BOLD CYAN "\n╔══════════════════════════════════════════╗\n");
+    printf(       "║         DYNAMIC SYMBOLS (.dynsym)       ║\n");
+    printf(       "╚══════════════════════════════════════════╝\n" RESET);
+    printf(BOLD "  %-6s %-16s %-8s %-10s %-10s %-10s %s\n" RESET,
+           "IDX","VALUE","SIZE","BIND","TYPE","VIS","NAME");
+
+    for (size_t i = 0; i < ctx->dynsym_count; i++) {
+        Elf64_Sym* sym = &ctx->dynsym[i];
+        const char* name = ctx->dynstr + sym->st_name;
+        if (!name || strlen(name) == 0) continue;
+
+        const char* bind = sym_bind_str(sym->st_info);
+        const char* type = sym_type_str(sym->st_info);
+        const char* vis  = sym_vis_str(sym->st_other);
+
+        // Color FUNC symbols green
+        if (ELF64_ST_TYPE(sym->st_info) == STT_FUNC) {
+            printf(GREEN "  %-6zu 0x%-14lx %-8lu %-10s %-10s %-10s %s\n" RESET,
+                   i, sym->st_value, sym->st_size, bind, type, vis, name);
+        } else {
+            printf("  %-6zu 0x%-14lx %-8lu %-10s %-10s %-10s %s\n",
+                   i, sym->st_value, sym->st_size, bind, type, vis, name);
+        }
+    }
+    printf(YELLOW "\n  Total dynamic symbols: %zu\n" RESET, ctx->dynsym_count);
+}
+
+void dump_static_symbols(ELFCtx* ctx) {
+    if (!ctx->symtab || !ctx->strtab) {
+        printf(YELLOW "\n[~] No .symtab section (stripped binary).\n" RESET);
+        return;
+    }
+
+    printf(BOLD CYAN "\n╔══════════════════════════════════════════╗\n");
+    printf(       "║         STATIC SYMBOLS (.symtab)        ║\n");
+    printf(       "╚══════════════════════════════════════════╝\n" RESET);
+    printf(BOLD "  %-6s %-16s %-8s %-10s %-10s %s\n" RESET,
+           "IDX","VALUE","SIZE","BIND","TYPE","NAME");
+
+    size_t printed = 0;
+    for (size_t i = 0; i < ctx->sym_count; i++) {
+        Elf64_Sym* sym = &ctx->symtab[i];
+        const char* name = ctx->strtab + sym->st_name;
+        if (!name || strlen(name) == 0) continue;
+
+        printf("  %-6zu 0x%-14lx %-8lu %-10s %-10s %s\n",
+               i, sym->st_value, sym->st_size,
+               sym_bind_str(sym->st_info),
+               sym_type_str(sym->st_info),
+               name);
+        printed++;
+    }
+    printf(YELLOW "\n  Total static symbols: %zu\n" RESET, printed);
+}
+
+void dump_dynamic_section(ELFCtx* ctx) {
+    for (int i = 0; i < ctx->ehdr->e_shnum; i++) {
+        Elf64_Shdr* sh = &ctx->shdrs[i];
+        if (sh->sh_type != SHT_DYNAMIC) continue;
+
+        printf(BOLD CYAN "\n╔══════════════════════════════════════════╗\n");
+        printf(       "║         DYNAMIC SECTION (.dynamic)      ║\n");
+        printf(       "╚══════════════════════════════════════════╝\n" RESET);
+
+        Elf64_Dyn* dyn = (Elf64_Dyn*)(ctx->base + sh->sh_offset);
+        size_t     count = sh->sh_size / sizeof(Elf64_Dyn);
+
+        for (size_t j = 0; j < count; j++) {
+            if (dyn[j].d_tag == DT_NULL) break;
+
+            const char* tag_name;
+            switch (dyn[j].d_tag) {
+                case DT_NEEDED:   tag_name = "NEEDED";   break;
+                case DT_SONAME:   tag_name = "SONAME";   break;
+                case DT_RPATH:    tag_name = "RPATH";    break;
+                case DT_RUNPATH:  tag_name = "RUNPATH";  break;
+                case DT_INIT:     tag_name = "INIT";     break;
+                case DT_FINI:     tag_name = "FINI";     break;
+                case DT_HASH:     tag_name = "HASH";     break;
+                case DT_STRTAB:   tag_name = "STRTAB";   break;
+                case DT_SYMTAB:   tag_name = "SYMTAB";   break;
+                case DT_PLTREL:   tag_name = "PLTREL";   break;
+                case DT_PLTRELSZ: tag_name = "PLTRELSZ"; break;
+                case DT_FLAGS:    tag_name = "FLAGS";     break;
+                case DT_FLAGS_1:  tag_name = "FLAGS_1";   break;
+                default:          tag_name = "OTHER";     break;
+            }
+
+            if (dyn[j].d_tag == DT_NEEDED && ctx->dynstr) {
+                printf("  %-12s  %s\n", tag_name,
+                       ctx->dynstr + dyn[j].d_un.d_val);
+            } else {
+                printf("  %-12s  0x%lx\n", tag_name, dyn[j].d_un.d_val);
+            }
+        }
+        return;
+    }
+    printf(YELLOW "\n[~] No .dynamic section found.\n" RESET);
+}
+
+void dump_runtime(const char* path) {
+    printf(BOLD CYAN "\n╔══════════════════════════════════════════╗\n");
+    printf(       "║         RUNTIME DLOPEN DUMP             ║\n");
+    printf(       "╚══════════════════════════════════════════╝\n" RESET);
+
+    void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        printf(RED "  [!] dlopen failed: %s\n" RESET, dlerror());
+        return;
+    }
+
+    // Walk link map to get load address
+    struct link_map* lm;
+    dlinfo(handle, RTLD_DI_LINKMAP, &lm);
+    printf(GREEN "  [+] Loaded at: 0x%lx\n" RESET, lm->l_addr);
+    printf(GREEN "  [+] Path:      %s\n" RESET, lm->l_name);
+
+    dlclose(handle);
+}
+
+// ── MAIN ─────────────────────────────────────────────────────────────────────
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        printf(BOLD "\nUsage: %s <target.so> [--no-static] [--no-dynamic] "
+               "[--no-runtime]\n\n" RESET, argv[0]);
+        printf("  --no-static    Skip .symtab dump\n");
+        printf("  --no-dynamic   Skip .dynsym dump\n");
+        printf("  --no-runtime   Skip dlopen runtime dump\n\n");
+        return 1;
+    }
+
+    int skip_static  = 0;
+    int skip_dynamic = 0;
+    int skip_runtime = 0;
+
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--no-static")  == 0) skip_static  = 1;
+        if (strcmp(argv[i], "--no-dynamic") == 0) skip_dynamic = 1;
+        if (strcmp(argv[i], "--no-runtime") == 0) skip_runtime = 1;
+    }
+
+    printf(BOLD GREEN "\n  sourcecodelibbsd.so — ELF Lib Dumper\n" RESET);
+    printf("  Target: %s\n", argv[1]);
+
+    ELFCtx ctx = {0};
+    if (load_elf(argv[1], &ctx) != 0) return 1;
+
+    dump_header(&ctx);
+    dump_sections(&ctx);
+    dump_segments(&ctx);
+    dump_dynamic_section(&ctx);
+
+    if (!skip_dynamic) dump_dynamic_symbols(&ctx);
+    if (!skip_static)  dump_static_symbols(&ctx);
+    if (!skip_runtime) dump_runtime(argv[1]);
+
+    munmap(ctx.base, ctx.size);
+
+    printf(BOLD GREEN "\n  Done.\n\n" RESET);
+    return 0;
+}
